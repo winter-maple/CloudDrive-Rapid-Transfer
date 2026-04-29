@@ -13,7 +13,7 @@
 1. 首先需要给浏览器安装 [Tampermonkey (油猴) 插件](https://www.tampermonkey.net/)。
 2. 点击下方链接一键安装脚本：
 
-👉 [**点击这里一键安装脚本**](请把刚才复制的Raw链接粘贴到这个括号里，替换掉这段中文字！)
+👉 [**点击这里一键安装脚本**](chrome-extension://dhdgffkkebhmkfjojejmpbldmpobfkfo/ask.html?aid=eed7bf82-cba4-4114-948c-7cc9e0772ea8)
 
 ## ⚠️ 注意事项
 * 夸克网盘分享页提取需要手动抓取并填入 Cookie。
