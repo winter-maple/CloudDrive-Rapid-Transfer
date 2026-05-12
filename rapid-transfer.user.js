@@ -1,7 +1,7 @@
 
 // ==UserScript==
 // @name         云盘秒传工具（百度/夸克/天翼/123/光鸭）- 修复版
-// @version      2026.04.29_Fixed
+// @version      2026.05.12
 // @description  云盘秒传工具（百度/夸克/天翼/123/光鸭）
 // @run-at       document-idle
 // @match        https://pan.quark.cn/*
