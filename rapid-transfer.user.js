@@ -48,6 +48,7 @@
     const KEY_GUANGYA_ACCESS_TOKEN = "guangya_guangyapan_access_token";
     const BTN_GUANGYA_IMPORT_ID = "guangya-guangya-import-json-btn";
     const INVALID_ETAG_POLICY = localStorage.getItem("guangya_etag_policy") || "skip";
+    const GUANGYA_DEBUG = localStorage.getItem("guangya_debug") === "1";
     const BTN_ID = "guangya-json-generator-btn";
     const GUANGYA_BTN_TYPO_STYLE_ID = "guangya-rapid-json-typography";
     const GUANGYA_TIANYI_SHARE_STYLE_ID = "guangya-tianyi-share-flex";
@@ -60,6 +61,16 @@
         } catch {
             return String(obj);
         }
+    }
+
+    function guangyaDebugLog(...args) {
+        if (!GUANGYA_DEBUG) return;
+        console.log("[秒传工具][debug]", ...args);
+    }
+
+    function guangyaDebugWarn(...args) {
+        if (!GUANGYA_DEBUG) return;
+        console.warn("[秒传工具][debug]", ...args);
     }
 
     /** 秒传导入 JSON 文件/文本结构校验（不含 token、不校验每条 md5 是否合法） */
@@ -976,6 +987,53 @@
                             : [];
                         if (!best || ks.length > best.keys.length) {
                             best = { keys: ks, unselectedKeys: us };
+                        }
+                    }
+                }
+            }
+            let ch = cur.child;
+            while (ch) {
+                q.push(ch);
+                ch = ch.sibling;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * 深度遍历 React Fiber，寻找同时包含 list + selectedRowKeys 的表格/列表 props。
+     * 适用于天翼家庭盘这类 AntD/React 页面，可将选中 key 映射回完整文件对象。
+     */
+    function scanFiberForListSelectionRecords(rootFiber, maxNodes) {
+        const limit = maxNodes == null ? 12000 : maxNodes;
+        if (!rootFiber) return null;
+        const q = [rootFiber];
+        let nodes = 0;
+        let best = null;
+        while (q.length && nodes < limit) {
+            const cur = q.shift();
+            nodes++;
+            if (!cur) continue;
+            const mp = cur.memoizedProps || cur.pendingProps;
+            if (mp && typeof mp === "object") {
+                let list = null;
+                let keys = null;
+                if (Array.isArray(mp.list)) list = mp.list;
+                if (Array.isArray(mp.selectedRowKeys)) keys = mp.selectedRowKeys;
+                const rs = mp.rowSelection;
+                if ((!keys || !keys.length) && rs && typeof rs === "object") {
+                    if (Array.isArray(rs.selectedRowKeys)) keys = rs.selectedRowKeys;
+                }
+                if ((!list || !list.length) && Array.isArray(mp.dataSource)) list = mp.dataSource;
+                if ((!keys || !keys.length) && Array.isArray(mp.checkedKeys)) keys = mp.checkedKeys;
+                if (Array.isArray(list) && Array.isArray(keys) && list.length && keys.length) {
+                    const normKeys = keys
+                        .map((k) => String(k == null ? "" : k).trim())
+                        .filter(Boolean);
+                    if (normKeys.length) {
+                        const score = normKeys.length * 100000 + list.length;
+                        if (!best || score > best.score) {
+                            best = { list, keys: normKeys, score };
                         }
                     }
                 }
@@ -2062,20 +2120,134 @@
     };
 
     const tianyi = {
+        getSelectedFilesFromReactList() {
+            try {
+                const roots = document.querySelectorAll(
+                    ".ant-table-wrapper, .ant-table, [class*='ant-table'], .ant-spin-nested-loading, [class*='file-list']",
+                );
+                let best = null;
+                for (let i = 0; i < roots.length; i++) {
+                    const fiber = getReactFiberFromDom(roots[i]);
+                    if (!fiber) continue;
+                    const hit = scanFiberForListSelectionRecords(fiber, 12000);
+                    if (hit && (!best || hit.score > best.score)) {
+                        best = hit;
+                    }
+                }
+                const appRoot =
+                    document.getElementById("root") ||
+                    document.getElementById("app") ||
+                    document.body;
+                const rf = getReactFiberFromDom(appRoot);
+                if (rf) {
+                    const hit = scanFiberForListSelectionRecords(rf, 16000);
+                    if (hit && (!best || hit.score > best.score)) {
+                        best = hit;
+                    }
+                }
+                if (!best || !best.list || !best.keys) {
+                    guangyaDebugLog("[tianyi] react selection miss");
+                    return [];
+                }
+                const keySet = new Set(best.keys);
+                const matched = best.list.filter((item) => {
+                    if (!item || typeof item !== "object") return false;
+                    const ids = [
+                        item.id,
+                        item.fileId,
+                        item.fileid,
+                        item.folderId,
+                        item.folder_id,
+                        item.catalogId,
+                        item.catalog_id,
+                        item.dataKey,
+                        item.key,
+                    ]
+                        .map((v) => String(v == null ? "" : v).trim())
+                        .filter(Boolean);
+                    return ids.some((id) => keySet.has(id));
+                });
+                guangyaDebugLog("[tianyi] react selection hit", {
+                    selectedKeys: best.keys.length,
+                    listSize: best.list.length,
+                    matched: matched.length,
+                });
+                return matched;
+            } catch (err) {
+                guangyaDebugWarn("[tianyi] react selection error", err);
+                return [];
+            }
+        },
+
         /** 优先页面 API（unsafeWindow），再回退 DOM + __vue__。 */
         getSelectedFiles() {
             try {
+                const pageKind = detectTianyiPageKind().kind;
                 if (typeof unsafeWindow !== "undefined") {
                     let list;
-                    if (/\/web\/share/.test(location.href)) {
+                    if (pageKind === "share" || pageKind === "family-share") {
                         list = unsafeWindow.shareUser?.getSelectedFileList?.();
                     } else {
-                        list = unsafeWindow.file?.getSelectedFileList?.();
+                        list =
+                            unsafeWindow.file?.getSelectedFileList?.() ||
+                            unsafeWindow.familyFile?.getSelectedFileList?.() ||
+                            unsafeWindow.family?.getSelectedFileList?.();
                     }
-                    if (list && list.length > 0) return list;
+                    if (list && list.length > 0) {
+                        guangyaDebugLog("[tianyi] selected files from unsafeWindow", {
+                            count: list.length,
+                            source:
+                                pageKind === "share" || pageKind === "family-share"
+                                    ? "shareUser"
+                                    : unsafeWindow.file?.getSelectedFileList
+                                      ? "file"
+                                      : unsafeWindow.familyFile?.getSelectedFileList
+                                        ? "familyFile"
+                                        : "family",
+                            pageKind,
+                        });
+                        return list;
+                    }
                 }
-            } catch {
-                // ignore
+            } catch (err) {
+                guangyaDebugWarn("[tianyi] unsafeWindow selection error", err);
+            }
+
+            const reactSelected = this.getSelectedFilesFromReactList();
+            if (reactSelected.length > 0) {
+                const normalized = reactSelected.map((fileData) => {
+                    const fid =
+                        fileData.id ||
+                        fileData.fileId ||
+                        fileData.fileid ||
+                        fileData.folderId ||
+                        fileData.folder_id ||
+                        fileData.catalogId ||
+                        fileData.catalog_id;
+                    return {
+                        ...fileData,
+                        id: fid,
+                        fileId: fid,
+                        name: fileData.name || fileData.fileName,
+                        fileName: fileData.name || fileData.fileName,
+                        isFolder: !!(
+                            fileData.isFolder ||
+                            fileData.fileCata === 2 ||
+                            fileData.isDir ||
+                            fileData.dir === true ||
+                            fileData.folder === true ||
+                            fileData.type === 1
+                        ),
+                        fileCata: fileData.fileCata,
+                        md5: fileData.md5 || fileData.fileMd5 || fileData.digest,
+                        size: fileData.size || fileData.fileSize,
+                    };
+                });
+                guangyaDebugLog("[tianyi] selected files from react fallback", {
+                    count: normalized.length,
+                    sample: normalized.slice(0, 2),
+                });
+                return normalized;
             }
 
             const selectedItems = [];
@@ -2090,7 +2262,10 @@
                 }
             }
 
-            if (selectedElements.length === 0) return [];
+            if (selectedElements.length === 0) {
+                guangyaDebugLog("[tianyi] no selected elements from DOM fallback");
+                return [];
+            }
 
             selectedElements.forEach((itemEl) => {
                 if (itemEl.__vue__) {
@@ -2116,6 +2291,10 @@
                         }
                     }
                 }
+            });
+            guangyaDebugLog("[tianyi] selected files from DOM/Vue fallback", {
+                count: selectedItems.length,
+                sample: selectedItems.slice(0, 2),
             });
             return selectedItems;
         },
@@ -2299,6 +2478,10 @@
             const appKey = "600100422";
             const timestamp = String(Date.now());
             const params = { fileId: String(fileId) };
+            if (location.pathname.startsWith("/web/family/")) {
+                params.family = "1";
+                params.catalogType = "family";
+            }
             const signature = this.sign({
                 ...params,
                 Timestamp: timestamp,
@@ -2340,6 +2523,8 @@
             const files = [];
             let pageNum = 1;
             const pageSize = 100;
+            const isFamily = location.pathname.startsWith("/web/family/");
+            guangyaDebugLog("[tianyi] listPersonal start", { folderId, path, isFamily });
             while (true) {
                 const appKey = "600100422";
                 const timestamp = String(Date.now());
@@ -2350,6 +2535,10 @@
                     orderBy: "lastOpTime",
                     descending: "true",
                 };
+                if (isFamily) {
+                    params.family = "1";
+                    params.catalogType = "family";
+                }
                 const signature = this.sign({
                     ...params,
                     Timestamp: timestamp,
@@ -2368,9 +2557,26 @@
                     }),
                 );
                 const data = /** @type {any} */ (JSON.parse(text));
-                if (data.res_code !== 0) break;
+                if (data.res_code !== 0) {
+                    guangyaDebugWarn("[tianyi] listPersonal non-zero response", {
+                        folderId,
+                        pageNum,
+                        res_code: data.res_code,
+                        res_message: data.res_message,
+                    });
+                    throw new Error(
+                        data.res_message ||
+                            `天翼目录读取失败(folderId=${folderId}, page=${pageNum}, code=${data.res_code})`,
+                    );
+                }
                 const fileList = data.fileListAO?.fileList || [];
                 const folderList = data.fileListAO?.folderList || [];
+                guangyaDebugLog("[tianyi] listPersonal page", {
+                    folderId,
+                    pageNum,
+                    fileCount: fileList.length,
+                    folderCount: folderList.length,
+                });
                 if (!fileList.length && !folderList.length) break;
 
                 for (const f of fileList) {
@@ -2393,6 +2599,10 @@
 
         async getFiles() {
             const selected = this.getSelectedFiles();
+            guangyaDebugLog("[tianyi] getFiles selected", {
+                count: selected.length,
+                sample: selected.slice(0, 2),
+            });
             if (!selected.length) throw new Error("请先勾选天翼文件/文件夹");
             const all = [];
             for (const item of selected) {
@@ -2411,6 +2621,10 @@
                 }
             }
             if (!all.length) throw new Error("未找到可导出的天翼文件");
+            guangyaDebugLog("[tianyi] collected files", {
+                count: all.length,
+                sample: all.slice(0, 2),
+            });
 
             const missing = all.filter((f) => f.path && !f.etag && f.fileId);
             for (let i = 0; i < missing.length; i++) {
@@ -2538,6 +2752,13 @@
         ) {
             const files = [];
             let page = 1;
+            guangyaDebugLog("[tianyi] listShare start", {
+                shareId,
+                shareDirFileId,
+                fileId,
+                path,
+                shareMode,
+            });
             while (true) {
                 const params = {
                     pageNum: String(page),
@@ -2572,14 +2793,40 @@
                         '"$1":"$2"',
                     );
                     data = JSON.parse(fixedText);
-                } catch {
-                    break;
+                } catch (err) {
+                    guangyaDebugWarn("[tianyi] listShare parse error", {
+                        shareId,
+                        shareDirFileId,
+                        fileId,
+                        page,
+                        error: String(err || ""),
+                    });
+                    throw new Error(`解析天翼分享目录失败(page=${page})`);
                 }
                 if (data.res_code !== 0) {
-                    break;
+                    guangyaDebugWarn("[tianyi] listShare non-zero response", {
+                        shareId,
+                        shareDirFileId,
+                        fileId,
+                        page,
+                        res_code: data.res_code,
+                        res_message: data.res_message,
+                    });
+                    throw new Error(
+                        data.res_message ||
+                            `天翼分享目录读取失败(page=${page}, code=${data.res_code})`,
+                    );
                 }
                 const fileList = data.fileListAO?.fileList || [];
                 const folderList = data.fileListAO?.folderList || [];
+                guangyaDebugLog("[tianyi] listShare page", {
+                    shareId,
+                    shareDirFileId,
+                    fileId,
+                    page,
+                    fileCount: fileList.length,
+                    folderCount: folderList.length,
+                });
                 for (const f of fileList) {
                     files.push({
                         path: path ? `${path}/${f.name}` : f.name,
@@ -3801,7 +4048,7 @@ function guangyaExtractMd5FromEtag(raw) {
                     files = await quark.getHomeFiles();
                 }
             } else if (host.includes("cloud.189.cn")) {
-                const isMain = location.pathname.startsWith("/web/main");
+                const isMain = isTianyiMainLikePage();
                 if (isMain) {
                     files = await tianyi.getFiles();
                 } else {
@@ -3925,8 +4172,53 @@ function guangyaExtractMd5FromEtag(raw) {
         return best;
     }
 
+    function detectTianyiPageKind() {
+        const path = location.pathname || "";
+        const href = location.href || "";
+        const isShareUrl =
+            /\/web\/share/.test(path) ||
+            /\/t\/[a-zA-Z0-9]+/.test(path) ||
+            /(?:^|[?&#])(code|shareCode|accessCode)=/i.test(href);
+        const hasShareToolbar = !!document.querySelector(
+            ".outlink-box-b .file-operate, .file-operate .btn-save-as",
+        );
+        const isShare = isShareUrl || hasShareToolbar;
+        const isFamily = path.startsWith("/web/family/");
+        const isFamilyMain =
+            isFamily &&
+            !isShare &&
+            (path === "/web/family/file/folder/home" ||
+                path.startsWith("/web/family/file/") ||
+                path.startsWith("/web/family/folder/"));
+        const kind = isShare
+            ? isFamily
+                ? "family-share"
+                : "share"
+            : isFamilyMain
+              ? "family-main"
+              : path.startsWith("/web/main")
+                ? "main"
+                : "unknown";
+        const info = {
+            path,
+            isShare,
+            isShareUrl,
+            hasShareToolbar,
+            isFamily,
+            isFamilyMain,
+            kind,
+        };
+        guangyaDebugLog("[tianyi] detect page", info);
+        return info;
+    }
+
+    function isTianyiMainLikePage() {
+        const info = detectTianyiPageKind();
+        return info.kind === "main" || info.kind === "family-main";
+    }
+
     function resolveTianyiContainer() {
-        const isMain = location.pathname.startsWith("/web/main");
+        const isMain = isTianyiMainLikePage();
         if (!isMain) {
             const shareSelectors = [
                 ".file-operate",
@@ -3991,7 +4283,7 @@ function guangyaExtractMd5FromEtag(raw) {
      */
     function tryMountTianyiBesideToolbar() {
         if (!location.hostname.includes("cloud.189.cn")) return false;
-        const isMain = location.pathname.startsWith("/web/main");
+        const isMain = isTianyiMainLikePage();
         const existing = document.getElementById(BTN_ID);
         if (existing && isGuangyaBtnOkOnTianyi(existing)) return true;
 
@@ -4395,7 +4687,7 @@ function guangyaExtractMd5FromEtag(raw) {
         injectGuangyaButtonTypographyStyles();
         if (
             location.hostname.includes("cloud.189.cn") &&
-            !location.pathname.startsWith("/web/main")
+            !isTianyiMainLikePage()
         ) {
             ensureTianyiShareToolbarFlexStyle();
         }
@@ -4422,6 +4714,22 @@ function guangyaExtractMd5FromEtag(raw) {
     }
 
     if (typeof GM_registerMenuCommand === "function") {
+        try {
+            GM_registerMenuCommand("[秒传工具] 开启调试日志", () => {
+                localStorage.setItem("guangya_debug", "1");
+                alert("已开启调试日志。刷新页面后生效。\n关闭方式：菜单里点“关闭调试日志”或在控制台执行 localStorage.removeItem('guangya_debug')");
+            });
+        } catch {
+            /* ignore */
+        }
+        try {
+            GM_registerMenuCommand("[秒传工具] 关闭调试日志", () => {
+                localStorage.removeItem("guangya_debug");
+                alert("已关闭调试日志。刷新页面后生效。");
+            });
+        } catch {
+            /* ignore */
+        }
         try {
             GM_registerMenuCommand("[秒传工具] 清除当前网盘 access_token（GM 保存）", () => {
                 GM_setValue(KEY_GUANGYA_ACCESS_TOKEN, "");
